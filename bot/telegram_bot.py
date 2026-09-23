@@ -226,9 +226,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if direct_url:
             direct_section = (
                 f"\n\n🚀 **【手机满速高速直链下载（推荐）】**\n"
-                f"👉 [点击直接下载完整 ZIP 压缩包]({direct_url})\n"
-                f"*(无论 100MB 还是 2GB，手机浏览器均可极速满速下载，免解压分卷烦恼)*"
+                f"👉 [📥 点击一键下载【完整合集 ZIP】({pkg_result.total_size_mb} MB)]({direct_url})\n"
+                f"*(包含全部 {pkg_result.total_pins} 张原图与报告的完整单一压缩包，无需解压任何分卷)*"
             )
+
+        delivery_hint = (
+            f"📦 由于总大小（{pkg_result.total_size_mb} MB）超出 Telegram 50MB 上传限制，下方将通过分卷形式同步发送 Telegram 备份；\n"
+            f"💡 **强烈建议直接点击上方直链，一键直接保存完整无损大 ZIP！**"
+            if len(pkg_result.all_zip_parts) > 1 else
+            "📦 正在准备交付文件..."
+        )
 
         summary_text = (
             f"🎉 **【工作中任务已全部完成！】**\n\n"
@@ -238,7 +245,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• 挖掘出更高清原图：`{pkg_result.higher_res_count}` 张\n"
             f"• 总打包大小：`{pkg_result.total_size_mb} MB`"
             f"{direct_section}\n\n"
-            f"📦 正在准备交付文件..."
+            f"{delivery_hint}"
         )
         await status_msg.edit_text(summary_text, parse_mode=ParseMode.MARKDOWN)
 

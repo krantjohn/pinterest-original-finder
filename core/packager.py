@@ -141,19 +141,24 @@ class Packager:
         limit_bytes = (max_part_size_mb or settings.telegram_max_filesize_mb) * 1024 * 1024
         total_bytes = sum(f.stat().st_size for f in files_to_zip)
 
+        # 1. ALWAYS create the complete un-split master ZIP
+        master_zip = self.output_dir / f"{base_name}.zip"
+        with zipfile.ZipFile(master_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in files_to_zip:
+                zf.write(file_path, arcname=file_path.name)
+        logger.info(f"Created complete master ZIP: {master_zip} ({total_bytes / 1024 / 1024:.2f} MB)")
+
         zip_parts: List[Path] = []
 
-        # If fits within single archive
+        # If fits within single archive, parts is just master zip
         if total_bytes <= limit_bytes or len(files_to_zip) <= 3:
-            single_zip = self.output_dir / f"{base_name}.zip"
-            with zipfile.ZipFile(single_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-                for file_path in files_to_zip:
-                    zf.write(file_path, arcname=file_path.name)
-            zip_parts.append(single_zip)
-            logger.info(f"Created single ZIP: {single_zip} ({total_bytes / 1024 / 1024:.2f} MB)")
+            zip_parts.append(master_zip)
         else:
-            # Multi-part ZIP splitting
-            logger.info(f"Total size ({total_bytes / 1024 / 1024:.2f} MB) exceeds {max_part_size_mb} MB. Splitting...")
+            # Multi-part ZIP splitting (specifically for Telegram's 50MB per-document limit)
+            logger.info(
+                f"Total size ({total_bytes / 1024 / 1024:.2f} MB) exceeds Telegram 50MB limit. "
+                f"Generating split parts for Telegram document delivery..."
+            )
             part_num = 1
             current_part_files: List[Path] = [json_path, csv_path]
             current_part_size = json_path.stat().st_size + csv_path.stat().st_size
@@ -180,13 +185,13 @@ class Packager:
                     for fp in current_part_files:
                         zf.write(fp, arcname=fp.name)
                 zip_parts.append(part_zip)
-            logger.info(f"Created {len(zip_parts)} split ZIP archives.")
+            logger.info(f"Created {len(zip_parts)} split ZIP archives for Telegram.")
 
         success_count = sum(1 for r in results if r.status != "failed" and r.final_filepath)
         higher_res_count = sum(1 for r in results if r.is_higher_res)
 
         return PackageResult(
-            zip_path=zip_parts[0],
+            zip_path=master_zip,  # ALWAYS the full, un-split, complete ZIP archive!
             all_zip_parts=zip_parts,
             total_pins=len(results),
             success_count=success_count,
