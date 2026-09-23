@@ -110,6 +110,48 @@ class ImageDownloader:
             logger.debug(f"Failed to download candidate {url}: {e}")
             return None
 
+    @staticmethod
+    def _verify_same_image(
+        base_img: Optional[Image.Image],
+        cand_img: Image.Image,
+        max_dist: int = 7
+    ) -> Tuple[bool, str]:
+        """
+        Verify that candidate image is visually identical to baseline Pinterest image.
+        Uses aspect ratio tolerance and perceptual hashing (pHash & dHash).
+        """
+        if not base_img:
+            return True, "No baseline image to compare against"
+
+        # 1. Aspect Ratio check (must be within 15% tolerance)
+        w_b, h_b = base_img.size
+        w_c, h_c = cand_img.size
+        ratio_b = w_b / max(h_b, 1)
+        ratio_c = w_c / max(h_c, 1)
+        ratio_diff = abs(ratio_b - ratio_c) / ratio_b
+        if ratio_diff > 0.15:
+            return False, f"Aspect ratio mismatch ({ratio_b:.2f} vs {ratio_c:.2f}, diff={ratio_diff:.1%})"
+
+        # 2. Perceptual hash comparison (pHash)
+        try:
+            import imagehash
+            h_b = imagehash.phash(base_img)
+            h_c = imagehash.phash(cand_img)
+            dist = h_b - h_c
+            if dist > max_dist:
+                return False, f"Visual mismatch (pHash distance={dist} > {max_dist})"
+
+            dh_b = imagehash.dhash(base_img)
+            dh_c = imagehash.dhash(cand_img)
+            d_dist = dh_b - dh_c
+            if d_dist > max_dist + 2:
+                return False, f"Gradient mismatch (dHash distance={d_dist} > {max_dist + 2})"
+
+            return True, f"Visual verified (pHash={dist}, dHash={d_dist})"
+        except Exception as e:
+            logger.debug(f"Imagehash calculation error: {e}")
+            return False, f"Hash check error: {e}"
+
     def process_pin(self, pin: PinItem) -> DownloadResult:
         """
         Process a single Pin following the 3-tier cascade:
@@ -118,11 +160,50 @@ class ImageDownloader:
         3. Fallback to Pinterest originals
         """
         logger.info(f"Processing Pin [{pin.identifier}] - {pin.title or 'No Title'}")
-        
+
+        # Check if already processed and saved in output_dir (instant cache)
+        existing_matches = list(self.output_dir.glob(f"{pin.identifier}_*.*"))
+        if existing_matches:
+            matched_file = existing_matches[0]
+            if matched_file.is_file() and matched_file.stat().st_size > 1024:
+                try:
+                    with Image.open(matched_file) as im:
+                        f_w, f_h = im.size
+                    p_w = pin.pinterest_width or f_w
+                    p_h = pin.pinterest_height or f_h
+                    is_higher = (f_w * f_h > p_w * p_h * 1.1)
+                    logger.info(f"Pin [{pin.identifier}] already in local cache ({f_w}x{f_h}), skipping network fetch.")
+                    return DownloadResult(
+                        pin_id=pin.pin_id,
+                        pin_url=pin.pin_url,
+                        title=pin.title,
+                        source_link=pin.source_link,
+                        pinterest_orig_url=pin.pinterest_orig_url,
+                        final_filepath=str(matched_file),
+                        final_filename=matched_file.name,
+                        final_source_url=pin.source_link or pin.pinterest_orig_url,
+                        source_channel="local_cache",
+                        status="cached",
+                        status_label="已从本地高速缓存载入",
+                        pinterest_resolution=f"{p_w}x{p_h}",
+                        final_resolution=f"{f_w}x{f_h}",
+                        final_width=f_w,
+                        final_height=f_h,
+                        file_size_bytes=matched_file.stat().st_size,
+                        is_higher_res=is_higher
+                    )
+                except Exception:
+                    pass
+
         # 1. Baseline: Download Pinterest originals version
         pinterest_data = self._download_and_inspect_image(pin.pinterest_orig_url)
+        baseline_img = None
         if pinterest_data:
             pin_bytes, p_width, p_height, p_ext = pinterest_data
+            try:
+                baseline_img = Image.open(io.BytesIO(pin_bytes))
+            except Exception:
+                pass
         else:
             pin_bytes, p_width, p_height, p_ext = b"", pin.pinterest_width, pin.pinterest_height, "jpg"
 
@@ -144,13 +225,11 @@ class ImageDownloader:
             logger.info(f"Tier 1: Inspecting source link: {pin.source_link}")
             self._sleep_polite()
             candidates = self.source_finder.extract_candidates(pin.source_link)
-            
-            # Test top candidates from source link (up to 5)
+
             for cand in candidates[:5]:
-                # If cand is a webpage rather than image, skip direct download
                 if not cand.url.startswith("http"):
                     continue
-                
+
                 self._sleep_polite()
                 cand_data = self._download_and_inspect_image(cand.url, cand.headers)
                 if not cand_data:
@@ -159,7 +238,17 @@ class ImageDownloader:
                 c_bytes, c_width, c_height, c_ext = cand_data
                 c_pixels = c_width * c_height
 
-                # Noticeably higher resolution check (at least 10% more pixels, or larger dimension)
+                # Verify visual identity first
+                try:
+                    cand_img = Image.open(io.BytesIO(c_bytes))
+                    is_same, verify_msg = self._verify_same_image(baseline_img, cand_img)
+                    if not is_same:
+                        logger.warning(f"Tier 1 candidate rejected: {verify_msg} ({cand.url})")
+                        continue
+                except Exception:
+                    continue
+
+                # Noticeably higher resolution check
                 if c_pixels > baseline_pixels * 1.10:
                     logger.info(
                         f"Found superior resolution via source link: "
@@ -182,10 +271,8 @@ class ImageDownloader:
             self._sleep_polite()
             reverse_cands = self.reverse_searcher.search(pin.pinterest_orig_url)
 
-            # Test top reverse search candidates (up to 6)
-            for cand in reverse_cands[:6]:
+            for cand in reverse_cands[:8]:
                 self._sleep_polite()
-                # If candidate is a page (like pixiv/artstation link from SauceNAO), resolve via source_finder
                 target_urls = [cand.url]
                 if not self.source_finder.is_direct_image(cand.url):
                     sub_cands = self.source_finder.extract_candidates(cand.url)
@@ -200,10 +287,20 @@ class ImageDownloader:
                     c_bytes, c_width, c_height, c_ext = cand_data
                     c_pixels = c_width * c_height
 
+                    # STRICT visual identity check! Reject different illustrations of same character
+                    try:
+                        cand_img = Image.open(io.BytesIO(c_bytes))
+                        is_same, verify_msg = self._verify_same_image(baseline_img, cand_img)
+                        if not is_same:
+                            logger.warning(f"Tier 2 candidate rejected: {verify_msg} ({t_url})")
+                            continue
+                    except Exception:
+                        continue
+
                     if c_pixels > baseline_pixels * 1.15:
                         logger.info(
                             f"Found superior resolution via reverse search: "
-                            f"{c_width}x{c_height} > {pinterest_res_str}"
+                            f"{c_width}x{c_height} > {pinterest_res_str} (Verified identical image!)"
                         )
                         best_bytes = c_bytes
                         best_width = c_width
@@ -212,7 +309,7 @@ class ImageDownloader:
                         best_source_url = t_url
                         best_channel = "reverse_search"
                         status = "found_via_reverse_search"
-                        status_label = f"成功通过反向搜图找到超大原图"
+                        status_label = "成功通过反向搜图找到超大原图"
                         is_higher_res = True
                         break
 

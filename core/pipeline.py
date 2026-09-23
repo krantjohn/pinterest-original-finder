@@ -66,15 +66,23 @@ class BoardPipeline:
             logger.warning("No pins found in the specified board/URL.")
             return self.packager.package([], board_slug=board_slug)
 
-        # Step 2: Download and select highest resolution
-        for index, pin in enumerate(pins, start=1):
+        # Step 2: Download and select highest resolution (Concurrent Worker Pool)
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        concurrency = 6 if total_pins >= 20 else (4 if total_pins >= 4 else 1)
+        logger.info(f"Processing {total_pins} pins with {concurrency} parallel workers...")
+
+        completed_count = 0
+        lock = threading.Lock()
+
+        def _worker(pin: PinItem) -> DownloadResult:
+            nonlocal completed_count
             try:
-                result = self.downloader.process_pin(pin)
-                results.append(result)
+                res = self.downloader.process_pin(pin)
             except Exception as e:
                 logger.error(f"Error processing pin {pin.identifier}: {e}")
-                # Create a failed record
-                result = DownloadResult(
+                res = DownloadResult(
                     pin_id=pin.pin_id,
                     pin_url=pin.pin_url,
                     title=pin.title,
@@ -83,13 +91,21 @@ class BoardPipeline:
                     status="failed",
                     status_label=f"处理异常: {e}"
                 )
-                results.append(result)
-
+            with lock:
+                completed_count += 1
+                current_idx = completed_count
             if on_progress:
                 try:
-                    on_progress(index, total_pins, result)
+                    on_progress(current_idx, total_pins, res)
                 except Exception as cb_err:
                     logger.debug(f"Progress callback error: {cb_err}")
+            return res
+
+        if concurrency > 1:
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                results = list(executor.map(_worker, pins))
+        else:
+            results = [_worker(p) for p in pins]
 
         # Step 3: Package into ZIP and generate reports
         pkg_result = self.packager.package(results, board_slug=board_slug)

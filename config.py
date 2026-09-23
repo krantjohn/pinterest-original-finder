@@ -80,7 +80,7 @@ class Settings:
     telegram_max_filesize_mb: int = 48
 
     # Limits
-    max_pins_per_board: int = 500
+    max_pins_per_board: int = 3000
 
 settings = Settings()
 
