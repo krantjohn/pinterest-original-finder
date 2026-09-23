@@ -42,6 +42,43 @@ class SourceFinder:
         path = parsed.path.lower()
         return any(path.endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff'))
 
+    @staticmethod
+    def expand_sample_urls(url: str) -> List[str]:
+        """
+        Expand downscaled booru sample/preview URLs into their full uncompressed originals.
+        Supports Safebooru, Danbooru, Gelbooru, Yande.re, Konachan, Zerochan.
+        """
+        expanded = []
+        # Safebooru/Gelbooru: /samples/4448/sample_xxx.jpg -> /images/4448/xxx.png and .jpg
+        if "/samples/" in url and "sample_" in url:
+            base = url.replace("/samples/", "/images/").replace("/sample_", "/")
+            for ext in [".png", ".jpg"]:
+                cand = re.sub(r"\.(?:jpg|jpeg|png)$", ext, base, flags=re.I)
+                expanded.append(cand)
+
+        # Danbooru: /sample/.../sample-xxx.jpg -> /original/.../xxx.png and .jpg
+        if "/sample/" in url and "sample-" in url:
+            base = url.replace("/sample/", "/original/").replace("/sample-", "/")
+            for ext in [".png", ".jpg"]:
+                cand = re.sub(r"\.(?:jpg|jpeg|png)$", ext, base, flags=re.I)
+                expanded.append(cand)
+
+        # Yande.re / Konachan: /sample/xxx%20sample%20xxx.jpg -> /image/xxx%20xxx.png/.jpg
+        if "/sample/" in url and ("%20sample%20" in url or "-sample-" in url):
+            base = url.replace("/sample/", "/image/").replace("%20sample%20", "%20").replace("-sample-", "-")
+            for ext in [".png", ".jpg"]:
+                cand = re.sub(r"\.(?:jpg|jpeg|png)$", ext, base, flags=re.I)
+                expanded.append(cand)
+
+        # Zerochan: s1.zerochan.net/xxx.240.xxx -> static.zerochan.net/xxx.full.xxx
+        if "zerochan.net" in url:
+            cand = re.sub(r"s[12]\.zerochan\.net", "static.zerochan.net", url)
+            cand = re.sub(r"\.(?:240|600)\.", ".full.", cand)
+            if cand != url:
+                expanded.append(cand)
+
+        return expanded
+
     def extract_candidates(self, source_url: Optional[str]) -> List[CandidateImage]:
         """Extract all potential high-resolution images from a given source URL."""
         if not source_url:
@@ -50,8 +87,16 @@ class SourceFinder:
         candidates: List[CandidateImage] = []
         source_url = source_url.strip()
 
-        # 1. Direct image link
+        # 1. Direct image link (check if it can be expanded from sample to full orig)
         if self.is_direct_image(source_url):
+            sample_expansions = self.expand_sample_urls(source_url)
+            for exp_url in sample_expansions:
+                candidates.append(CandidateImage(
+                    url=exp_url,
+                    source_type="booru_expanded_orig",
+                    source_url=source_url,
+                    expected_quality_score=97
+                ))
             candidates.append(CandidateImage(
                 url=source_url,
                 source_type="source_direct",
@@ -75,7 +120,10 @@ class SourceFinder:
                 if artstation_cand:
                     candidates.extend(artstation_cand)
 
-            elif any(b in domain for b in ["danbooru.donmai.us", "safebooru.org", "gelbooru.com", "yande.re", "konachan.com"]):
+            elif any(b in domain for b in [
+                "danbooru.donmai.us", "safebooru.org", "gelbooru.com", "yande.re",
+                "konachan.com", "zerochan.net", "sankakucomplex.com", "anime-pictures.net"
+            ]):
                 booru_cand = self._extract_booru(source_url, domain)
                 if booru_cand:
                     candidates.extend(booru_cand)
@@ -189,18 +237,91 @@ class SourceFinder:
         return candidates
 
     def _extract_booru(self, url: str, domain: str) -> List[CandidateImage]:
-        """Extract uncompressed original image from anime image boards."""
+        """Extract uncompressed original image from anime image boards (Danbooru, Safebooru, Gelbooru, Zerochan, etc.)."""
         candidates = []
+
+        # 1. Zerochan handling
+        if "zerochan.net" in domain:
+            try:
+                with httpx.Client(timeout=settings.request_timeout, headers=self.default_headers, follow_redirects=True) as client:
+                    resp = client.get(url)
+                    if resp.status_code == 200:
+                        soup = BeautifulSoup(resp.text, "html.parser")
+                        for a in soup.find_all("a", href=True):
+                            href = a["href"]
+                            if "static.zerochan.net" in href:
+                                candidates.append(CandidateImage(
+                                    url=href,
+                                    source_type="zerochan_orig",
+                                    source_url=url,
+                                    headers={"Referer": "https://www.zerochan.net/"},
+                                    expected_quality_score=96
+                                ))
+            except Exception as e:
+                logger.debug(f"Zerochan extraction error for {url}: {e}")
+            if candidates:
+                return candidates
+
+        # 2. Safebooru / Gelbooru with id=...
+        safebooru_match = re.search(r"[?&]id=(\d+)", url)
+        if safebooru_match and ("safebooru" in domain or "gelbooru" in domain):
+            post_id = safebooru_match.group(1)
+            dapi_url = f"https://{domain}/index.php?page=dapi&s=post&q=index&id={post_id}&json=1"
+            try:
+                with httpx.Client(timeout=settings.request_timeout, headers=self.default_headers) as client:
+                    resp = client.get(dapi_url)
+                    if resp.status_code == 200 and resp.text.strip().startswith("["):
+                        posts = resp.json()
+                        if posts and isinstance(posts, list):
+                            p = posts[0]
+                            file_url = p.get("file_url")
+                            if file_url:
+                                candidates.append(CandidateImage(
+                                    url=file_url,
+                                    source_type="booru_dapi_orig",
+                                    source_url=url,
+                                    width=p.get("width"),
+                                    height=p.get("height"),
+                                    expected_quality_score=96
+                                ))
+            except Exception as e:
+                logger.debug(f"Booru dapi error: {e}")
+
+            if not candidates:
+                try:
+                    with httpx.Client(timeout=settings.request_timeout, headers=self.default_headers, follow_redirects=True) as client:
+                        resp = client.get(url)
+                        if resp.status_code == 200:
+                            soup = BeautifulSoup(resp.text, "html.parser")
+                            orig_a = soup.find("a", string=re.compile(r"Original image|Original|View larger", re.I))
+                            if orig_a and orig_a.get("href"):
+                                href = urllib.parse.urljoin(url, orig_a["href"])
+                                candidates.append(CandidateImage(
+                                    url=href,
+                                    source_type="booru_html_orig",
+                                    source_url=url,
+                                    expected_quality_score=95
+                                ))
+                except Exception as e:
+                    logger.debug(f"Booru HTML scrape error: {e}")
+
+            if candidates:
+                return candidates
+
+        # 3. Danbooru / Moebooru JSON endpoint
         match = re.search(r'/post(?:s|/show)/(\d+)', url)
         if not match:
             return candidates
 
         post_id = match.group(1)
-        scheme = "https"
-        api_url = f"{scheme}://{domain}/posts/{post_id}.json"
+        api_url = f"https://{domain}/posts/{post_id}.json"
+
+        req_headers = self.default_headers.copy()
+        if "donmai.us" in domain:
+            req_headers["User-Agent"] = "PinterestOriginalFinder/2.0"
 
         try:
-            with httpx.Client(timeout=settings.request_timeout, headers=self.default_headers) as client:
+            with httpx.Client(timeout=settings.request_timeout, headers=req_headers) as client:
                 resp = client.get(api_url)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -214,8 +335,19 @@ class SourceFinder:
                             source_url=url,
                             width=data.get("image_width"),
                             height=data.get("image_height"),
-                            expected_quality_score=95
+                            expected_quality_score=96
                         ))
+
+                    # Trace back to original Pixiv or Twitter artist source!
+                    source = data.get("source") or ""
+                    if "pixiv.net" in source or "pximg.net" in source:
+                        pix_cands = self._extract_pixiv(source)
+                        if pix_cands:
+                            candidates.extend(pix_cands)
+                    elif "twitter.com" in source or "x.com" in source:
+                        tw_cands = self._extract_twitter(source)
+                        if tw_cands:
+                            candidates.extend(tw_cands)
         except Exception as e:
             logger.debug(f"Booru extraction error for {url}: {e}")
 

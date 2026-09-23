@@ -52,7 +52,15 @@ class ReverseSearcher:
             except Exception as e:
                 logger.debug(f"SauceNAO search error: {e}")
 
-            # 2. Yandex Reverse Image Search (great general web reverse search)
+            # 2. IQDB multi-booru anime search (Danbooru, Gelbooru, Konachan, Yande.re, Zerochan, etc.)
+            try:
+                iqdb_results = self._search_iqdb(image_url)
+                if iqdb_results:
+                    candidates.extend(iqdb_results)
+            except Exception as e:
+                logger.debug(f"IQDB search error: {e}")
+
+            # 3. Yandex Reverse Image Search (great general web reverse search)
             try:
                 yandex_results = self._search_yandex(image_url)
                 if yandex_results:
@@ -109,6 +117,60 @@ class ReverseSearcher:
                         source_url=ext_url,
                         expected_quality_score=int(score * (similarity / 100.0))
                     ))
+
+        return candidates
+
+    def _search_iqdb(self, image_url: str) -> List[CandidateImage]:
+        """Search IQDB (multi-booru anime image database: Danbooru, Gelbooru, Konachan, Yande.re, Zerochan, etc.)."""
+        api_url = f"https://iqdb.org/?url={urllib.parse.quote(image_url, safe=':/?=')}"
+        candidates = []
+        try:
+            with httpx.Client(
+                timeout=settings.request_timeout,
+                headers=self.headers,
+                follow_redirects=True
+            ) as client:
+                resp = client.get(api_url)
+                if resp.status_code != 200:
+                    return candidates
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                seen = set()
+                for table in soup.find_all("table"):
+                    td = table.find("td", class_="image")
+                    if td and td.find("a"):
+                        href = td.find("a").get("href", "").strip()
+                        if href.startswith("//"):
+                            href = "https:" + href
+                        if not href.startswith("http"):
+                            continue
+
+                        # Extract resolution info e.g. "2592×4002"
+                        match_res = re.search(r"(\d+)[×x](\d+)", table.text)
+                        width = int(match_res.group(1)) if match_res else None
+                        height = int(match_res.group(2)) if match_res else None
+
+                        # Check similarity
+                        sim_match = re.search(r"(\d+)%\s*similarity", table.text, re.I)
+                        sim = int(sim_match.group(1)) if sim_match else 50
+                        if sim < 45:
+                            continue
+
+                        if href not in seen:
+                            seen.add(href)
+                            parsed = urllib.parse.urlparse(href)
+                            domain = parsed.netloc.lower()
+                            score = self._calculate_domain_credibility(domain)
+                            candidates.append(CandidateImage(
+                                url=href,
+                                source_type="iqdb_match",
+                                source_url=href,
+                                width=width,
+                                height=height,
+                                expected_quality_score=int(score * (sim / 100.0) + 10)
+                            ))
+        except Exception as e:
+            logger.debug(f"IQDB reverse search error: {e}")
 
         return candidates
 
@@ -192,8 +254,11 @@ class ReverseSearcher:
         if any(t in domain for t in tier1):
             return 95
 
-        # Tier 2: Dedicated boorus (track artist & high-res files)
-        tier2 = ["danbooru.donmai.us", "gelbooru.com", "safebooru.org", "yande.re", "konachan.com"]
+        # Tier 2: Dedicated boorus & image hubs (track artist & high-res files)
+        tier2 = [
+            "danbooru.donmai.us", "gelbooru.com", "safebooru.org", "yande.re",
+            "konachan.com", "zerochan.net", "anime-pictures.net", "e-shuushuu.net", "sankakucomplex.com"
+        ]
         if any(t in domain for t in tier2):
             return 88
 

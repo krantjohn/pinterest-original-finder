@@ -75,6 +75,13 @@ class ImageDownloader:
         Returns: (bytes, width, height, extension) or None.
         """
         req_headers = self.headers.copy()
+        if "donmai.us" in url:
+            req_headers["User-Agent"] = "PinterestOriginalFinder/2.0"
+        elif "zerochan.net" in url:
+            req_headers["Referer"] = "https://www.zerochan.net/"
+        elif "pixiv.net" in url or "pximg.net" in url:
+            req_headers["Referer"] = "https://www.pixiv.net/"
+
         if extra_headers:
             req_headers.update(extra_headers)
 
@@ -271,13 +278,19 @@ class ImageDownloader:
             self._sleep_polite()
             reverse_cands = self.reverse_searcher.search(pin.pinterest_orig_url)
 
-            for cand in reverse_cands[:8]:
+            for cand in reverse_cands[:12]:
                 self._sleep_polite()
-                target_urls = [cand.url]
+                # 1. Expand booru samples if applicable
+                expanded_samples = self.source_finder.expand_sample_urls(cand.url)
+                target_urls = expanded_samples if expanded_samples else []
+
+                # 2. Extract sub candidates if webpage
                 if not self.source_finder.is_direct_image(cand.url):
                     sub_cands = self.source_finder.extract_candidates(cand.url)
                     if sub_cands:
-                        target_urls = [sc.url for sc in sub_cands[:2]]
+                        target_urls.extend([sc.url for sc in sub_cands[:3]])
+                else:
+                    target_urls.append(cand.url)
 
                 for t_url in target_urls:
                     cand_data = self._download_and_inspect_image(t_url, cand.headers)
@@ -319,6 +332,10 @@ class ImageDownloader:
         # --- Tier 3: Pinterest fallback check ---
         if not is_higher_res and not best_bytes and pinterest_data:
             best_bytes = pinterest_data[0]
+            if best_width >= 2000 or best_height >= 2000 or (best_width * best_height >= 3_500_000):
+                status_label = "Pinterest 官方已是超清母盘 (2K/4K原图)"
+            else:
+                status_label = "未找到更高清来源（使用 Pinterest 原图）"
 
         # Calculate final metrics
         final_pixels = best_width * best_height
