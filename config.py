@@ -82,7 +82,13 @@ class Settings:
     # Limits
     max_pins_per_board: int = 3000
 
+    # Storage retention & cleanup
+    auto_cleanup_raw_downloads: bool = True  # Clean up raw downloaded images after packaging into ZIP
+    zip_retention_hours: int = 24           # Retain generated ZIP archives for 24h, then auto-delete
+    max_output_storage_mb: int = 5000       # 5GB safety limit for output directory
+
 settings = Settings()
+
 
 # Ensure working directories exist
 settings.download_dir.mkdir(parents=True, exist_ok=True)

@@ -1,7 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 *.so
 .Python
 env/
@@ -31,6 +31,7 @@ cookies.txt
 downloads/
 output/
 test_downloads/
+gallery-dl/
 *.zip
 *.jpg
 *.jpeg
@@ -39,8 +40,12 @@ test_downloads/
 *.csv
 *.json
 
+# Cloudflare & Tunnels
+.cloudflared/
+
 # Logs
 *.log
+bot.log
 
 # IDE
 .vscode/

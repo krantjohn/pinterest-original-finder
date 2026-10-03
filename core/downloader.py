@@ -169,10 +169,22 @@ class ImageDownloader:
         logger.info(f"Processing Pin [{pin.identifier}] - {pin.title or 'No Title'}")
 
         # Check if already processed and saved in output_dir (instant cache)
-        existing_matches = list(self.output_dir.glob(f"{pin.identifier}_*.*"))
+        board_prefix = f"{pin.board_name}_" if pin.board_name else ""
+        existing_matches = (
+            list(self.output_dir.glob(f"{board_prefix}{pin.identifier}_*.*")) or
+            list(self.output_dir.glob(f"*{pin.identifier}_*.*"))
+        )
         if existing_matches:
             matched_file = existing_matches[0]
             if matched_file.is_file() and matched_file.stat().st_size > 1024:
+                # If existing file doesn't have the desired board prefix, rename it
+                if board_prefix and not matched_file.name.startswith(board_prefix):
+                    new_matched = self.output_dir / f"{board_prefix}{matched_file.name}"
+                    try:
+                        matched_file.rename(new_matched)
+                        matched_file = new_matched
+                    except Exception:
+                        pass
                 try:
                     with Image.open(matched_file) as im:
                         f_w, f_h = im.size
@@ -180,6 +192,7 @@ class ImageDownloader:
                     p_h = pin.pinterest_height or f_h
                     is_higher = (f_w * f_h > p_w * p_h * 1.1)
                     logger.info(f"Pin [{pin.identifier}] already in local cache ({f_w}x{f_h}), skipping network fetch.")
+
                     return DownloadResult(
                         pin_id=pin.pin_id,
                         pin_url=pin.pin_url,
@@ -343,9 +356,11 @@ class ImageDownloader:
         if baseline_pixels > 0:
             pct_increase = round(((final_pixels - baseline_pixels) / baseline_pixels) * 100, 1)
 
-        # Save to local disk
-        filename = f"{pin.identifier}_{best_width}x{best_height}.{best_ext}"
+        # Save to local disk (prefixed with board name for easy management)
+        board_prefix = f"{pin.board_name}_" if pin.board_name else ""
+        filename = f"{board_prefix}{pin.identifier}_{best_width}x{best_height}.{best_ext}"
         filepath = self.output_dir / filename
+
 
         if best_bytes:
             with open(filepath, "wb") as f:

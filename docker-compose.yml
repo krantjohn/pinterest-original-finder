@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  pinterest-bot:
+    build: .
+    container_name: pinterest-original-finder
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./output:/app/output
+      - ./cookies.txt:/app/cookies.txt:ro
+    ports:
+      - "8080:8080"
