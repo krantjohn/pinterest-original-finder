@@ -32,6 +32,7 @@ from telegram.ext import (
 
 from config import settings
 from core.pipeline import BoardPipeline
+from core.yande_finder import yande_finder, YandePost
 from utils.logger import logger
 from utils.tunnel_server import tunnel_server
 
@@ -61,7 +62,7 @@ def get_shortcut_keyboard():
     keyboard = [
         [
             InlineKeyboardButton("📖 使用帮助", callback_data="help"),
-            InlineKeyboardButton("⚡ 样例测试", callback_data="sample")
+            InlineKeyboardButton("🌸 Yande 搜图指南", callback_data="yande_help")
         ],
         [
             InlineKeyboardButton("📊 运行状态", callback_data="status"),
@@ -82,14 +83,15 @@ async def set_bot_commands(application):
     commands = [
         BotCommand("start", "启动机器人与打开功能面板"),
         BotCommand("help", "使用帮助与支持格式"),
+        BotCommand("yande", "Yande 每日热图原图提取指南"),
         BotCommand("status", "查看服务器与机器人状态"),
         BotCommand("sample", "获取测试图板链接快速体验"),
         BotCommand("cookie", "查看或配置 Pinterest Cookie 凭证"),
         BotCommand("decrypt", "解密导入加密的 cookies.json 文件"),
         BotCommand("clean", "清理服务器过期文件并查看磁盘空间"),
         BotCommand("saucenao", "查看或绑定 SauceNAO 搜图 API Key"),
-        BotCommand("stop", "终止当前正在执行的下载任务"),
-        BotCommand("cancel", "终止当前正在执行的下载任务"),
+        BotCommand("stop", "终止当前正在执行的任务"),
+        BotCommand("cancel", "终止当前正在执行的任务"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -100,15 +102,15 @@ async def set_bot_commands(application):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     welcome_text = (
-        "👋 **你好！我是 Pinterest 高清原图提取机器人 (Pinnta)**\n\n"
-        "⚡ **核心能力**：\n"
-        "• 输入 Pinterest 图板或单张 Pin 链接\n"
-        "• 优先通过作者 Outbound / 来源页面寻找原始无压缩超大图\n"
-        "• 自动通过反向搜图（Pixiv / Twitter / ArtStation / 个人站）兜底补全\n"
-        "• 自动打包成 ZIP 文件并附带完整处理报告（CSV/JSON）直接发回\n\n"
-        "📌 **使用方式**：\n"
-        "👉 **直接把 Pinterest 链接发给我即可开始！**\n"
-        "（支持完整图板链接、单 Pin 链接、手机端 `pin.it` 短链）\n\n"
+        "👋 **你好！我是插画与原图提取机器人 (Pinnta)**\n\n"
+        "⚡ **核心功能**：\n"
+        "1. 🌸 **Yande.re 每日热图秒提原图（全新支持）**：\n"
+        "   • 在任何 TG 群/频道浏览 Yande 每日热图时，**选中多张喜欢的图片，一口气全部转发给我**！\n"
+        "   • 无论转发图片被压缩成多小，机器人通过视觉检索精准定位 Yande 原帖。\n"
+        "   • 自动下载数千像素、无损 PNG/JPG 母盘，并以 **Telegram 无损文件文档 (Document)** 发回，附带画师原作链接。\n\n"
+        "2. 📌 **Pinterest 图板高清挖掘**：\n"
+        "   • 发送 Pinterest 图板或单 Pin 链接，自动逆向搜图、超分比对并打包 ZIP 下载。\n\n"
+        "📌 **直接把图片转发过来，或者把 Pinterest 链接发给我即可开始！**\n\n"
         "👇 你也可以点击下方快捷按钮体验："
     )
     if update.message:
@@ -122,19 +124,39 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command."""
     help_text = (
-        "📖 **使用指南 & 常见问题**\n\n"
-        "1. **支持哪些链接？**\n"
-        "   • 手机 App 分享的短链接：`https://pin.it/xxxxxx`\n"
-        "   • 完整图板链接：`https://www.pinterest.com/username/boardname/`\n"
-        "   • 单张 Pin：`https://www.pinterest.com/pin/123456789/`\n\n"
-        "2. **寻找原图的原理？**\n"
-        "   Pinterest 会压缩图片。机器人会深入来源页面（如 Pixiv / Twitter / 摄影站）抓取未压缩母盘，或通过反向搜图匹配超清版本。\n\n"
-        "3. **怎么接收结果？**\n"
-        "   处理完毕后，机器人会把打包好的 **ZIP 压缩包** 发回此聊天窗口，手机直接点击保存即可。"
+        "📖 **使用指南 & 常见操作**\n\n"
+        "1. **🌸 Yande.re 每日热图原图提取**：\n"
+        "   • **如何使用**：在 TG 群或频道中长按多选喜欢的图片，点击“转发”给本机器人。\n"
+        "   • **压缩图变原图**：即便转发的图片已被 TG 严重压缩，机器人通过 Yande 视觉库 + IQDB 秒级找到真实原帖。\n"
+        "   • **无损交付**：以文件文档 (Document) 形式原样发回，支持 4K/8K 超高分辨率与无损原件！\n\n"
+        "2. **📌 Pinterest 图板批量提取**：\n"
+        "   • 发送手机 App 分享短链（`pin.it/xxx`）或图板完整链接即可自动解析并打包。\n\n"
+        "3. **🛑 任务中断**：\n"
+        "   • 若中途想取消，点击进度消息下方的 `[ 🛑 停止本次任务 ]` 或发送 `/stop` 即可毫秒级终止。"
     )
     target = update.message or (update.callback_query.message if update.callback_query else None)
     if target:
         await target.reply_text(help_text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_shortcut_keyboard())
+
+
+async def yande_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /yande command."""
+    text = (
+        "🌸 <b>Yande.re 每日热图原图提取指南</b>\n\n"
+        "1. <b>使用场景</b>：\n"
+        "   在任意 Telegram 群组或频道浏览 Yande 每日热图、壁纸时，长按多选喜欢的图片，直接<b>一口气全部转发</b>给本机器人。\n\n"
+        "2. <b>全自动智能检索</b>：\n"
+        "   • <b>视觉特征比对</b>：即使转发图片被压缩成低清缩略图，通过 Yande 视觉库及 IQDB 双引擎 100% 锁定原帖。\n"
+        "   • <b>标签/ID 秒达</b>：若转发消息自带标签或 Post ID，自动免搜直达。\n\n"
+        "3. <b>最高清母盘交付</b>：\n"
+        "   • 以 Telegram <b>无损文件文档 (Document)</b> 形式发回，绝无任何二次压缩损耗。\n"
+        "   • 完整呈现原始分辨率（如 3000~6000 像素超清、无损 PNG）、画师名字与 Pixiv/推特原作直链！\n\n"
+        "💡 <b>单图/直链支持</b>：\n"
+        "   直接发 Yande 链接（如 <code>https://yande.re/post/show/1270146</code>）或单纯数字 ID（如 <code>1270146</code>）也能直接提取原图。"
+    )
+    target = update.message or (update.callback_query.message if update.callback_query else None)
+    if target:
+        await target.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,6 +473,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     if data == "help":
         await help_command(update, context)
+    elif data == "yande_help":
+        await yande_help_command(update, context)
     elif data == "status":
         await status_command(update, context)
     elif data == "sample":
@@ -459,9 +483,270 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await clean_command(update, context)
 
 
+@dataclass
+class QueuedYandeItem:
+    file_id: str
+    caption: str
+    message_id: int
+    is_document: bool
+
+
+class YandeBatchCoordinator:
+    """Coordinates batching, debouncing and processing of forwarded Yande images."""
+
+    def __init__(self):
+        self._queues: Dict[int, List[QueuedYandeItem]] = {}
+        self._tasks: Dict[int, asyncio.Task] = {}
+        self._locks: Dict[int, asyncio.Lock] = {}
+
+    def get_lock(self, chat_id: int) -> asyncio.Lock:
+        if chat_id not in self._locks:
+            self._locks[chat_id] = asyncio.Lock()
+        return self._locks[chat_id]
+
+    async def enqueue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.message
+        if not msg:
+            return
+
+        chat_id = update.effective_chat.id
+        file_id = ""
+        is_doc = False
+        if msg.photo:
+            file_id = msg.photo[-1].file_id
+        elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/"):
+            file_id = msg.document.file_id
+            is_doc = True
+        else:
+            return
+
+        item = QueuedYandeItem(
+            file_id=file_id,
+            caption=msg.caption or "",
+            message_id=msg.message_id,
+            is_document=is_doc
+        )
+
+        lock = self.get_lock(chat_id)
+        async with lock:
+            if chat_id not in self._queues:
+                self._queues[chat_id] = []
+            self._queues[chat_id].append(item)
+
+            if chat_id not in self._tasks or self._tasks[chat_id].done():
+                self._tasks[chat_id] = asyncio.create_task(
+                    self._process_queue(chat_id, context)
+                )
+
+    async def _process_queue(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        # Debounce to collect rapid forwarded messages (Telegram sends multi-select forwards in ~0.5-1.2s)
+        await asyncio.sleep(0.8)
+
+        status_msg = None
+        processed_count = 0
+        success_count = 0
+        yande_temp_dir = Path(settings.output_dir) / "yande"
+        yande_temp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            lock = self.get_lock(chat_id)
+            initial_count = len(self._queues.get(chat_id, []))
+            if initial_count == 0:
+                return
+
+            if initial_count == 1:
+                status_text = "🔍 正在解析图片并搜寻 Yande.re 最高清原图..."
+            else:
+                status_text = f"📥 已接收 <b>{initial_count}</b> 张转发图片，正在批量搜寻 Yande.re 最高清原图..."
+
+            status_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=status_text,
+                parse_mode=ParseMode.HTML
+            )
+
+            while True:
+                item = None
+                total_current = 0
+                async with lock:
+                    queue = self._queues.get(chat_id, [])
+                    if queue:
+                        item = queue.pop(0)
+                        total_current = processed_count + 1 + len(queue)
+
+                if not item:
+                    # Brief wait to catch any lagging forwarded message
+                    await asyncio.sleep(0.5)
+                    async with lock:
+                        queue = self._queues.get(chat_id, [])
+                        if queue:
+                            continue
+                    break
+
+                processed_count += 1
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+                if total_current > 1 and status_msg:
+                    try:
+                        await status_msg.edit_text(
+                            f"⏳ 正在处理 [<b>{processed_count}/{total_current}</b>]：深度检索并获取原图...",
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+
+                post = None
+                # 1. Quick match from caption
+                if item.caption:
+                    post_id = yande_finder.extract_id_from_text(item.caption)
+                    if post_id:
+                        post = await yande_finder.get_post_by_id(post_id)
+
+                # 2. Reverse search image bytes if no match from caption
+                if not post:
+                    try:
+                        tg_file = await context.bot.get_file(item.file_id)
+                        img_bytes = bytes(await tg_file.download_as_bytearray())
+                        post = await yande_finder.find_post_from_image(img_bytes)
+                    except Exception as err:
+                        logger.error(f"Error fetching/searching forwarded image: {err}")
+
+                if not post:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⚠️ 第 <b>{processed_count}</b> 张图片未能成功匹配到 Yande.re 原图（可能非 Yande 收录或裁切严重）。",
+                        parse_mode=ParseMode.HTML,
+                        reply_to_message_id=item.message_id
+                    )
+                    continue
+
+                # 3. Download and send original
+                try:
+                    if total_current > 1 and status_msg:
+                        try:
+                            await status_msg.edit_text(
+                                f"⏳ 正在处理 [<b>{processed_count}/{total_current}</b>]：下载无损原图 (Yande #{post.id}, {post.width}×{post.height})...",
+                                parse_mode=ParseMode.HTML
+                            )
+                        except Exception:
+                            pass
+
+                    local_file = await yande_finder.download_image(post, yande_temp_dir)
+                    file_size = local_file.stat().st_size
+                    file_size_mb = round(file_size / (1024 * 1024), 2)
+
+                    if file_size <= 49.5 * 1024 * 1024:
+                        with open(local_file, "rb") as f:
+                            await context.bot.send_document(
+                                chat_id=chat_id,
+                                document=f,
+                                filename=local_file.name,
+                                caption=post.format_caption(),
+                                parse_mode=ParseMode.HTML,
+                                reply_to_message_id=item.message_id
+                            )
+                        local_file.unlink(missing_ok=True)
+                    else:
+                        direct_url = tunnel_server.get_file_url(local_file)
+                        huge_text = (
+                            f"{post.format_caption()}\n\n"
+                            f"🚀 <b>【超大文件直链（超过 TG 50MB 限制）】</b>\n"
+                            f"👉 <a href=\"{direct_url}\">📥 点击极速下载完整无损原件 ({file_size_mb} MB)</a>"
+                        )
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=huge_text,
+                            parse_mode=ParseMode.HTML,
+                            reply_to_message_id=item.message_id
+                        )
+
+                    success_count += 1
+                except Exception as dl_err:
+                    logger.error(f"Error downloading/sending Yande #{post.id}: {dl_err}")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ 发送 Yande #{post.id} 原图失败：{dl_err}",
+                        reply_to_message_id=item.message_id
+                    )
+
+            if status_msg:
+                try:
+                    finish_text = (
+                        f"🎉 <b>Yande 原图处理完毕！</b>\n"
+                        f"• 成功提取交付：<b>{success_count}</b> 张高清原图\n"
+                        f"• 格式：无损文件文档 (Document) 发送，保持 100% 原始母盘细节！"
+                    )
+                    await status_msg.edit_text(finish_text, parse_mode=ParseMode.HTML)
+                    await asyncio.sleep(8)
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+        except Exception as queue_err:
+            logger.error(f"Queue processing error for chat {chat_id}: {queue_err}")
+        finally:
+            async with lock:
+                self._queues.pop(chat_id, None)
+                self._tasks.pop(chat_id, None)
+
+
+yande_batch_coordinator = YandeBatchCoordinator()
+
+
+async def handle_photo_or_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle forwarded or direct photos/images for Yande.re HD original extraction."""
+    await yande_batch_coordinator.enqueue(update, context)
+
+
+async def handle_yande_text_request(update: Update, context: ContextTypes.DEFAULT_TYPE, post_id: int):
+    """Handle direct Yande post ID or URL sent in text."""
+    chat_id = update.effective_chat.id
+    status_msg = await update.message.reply_text(
+        f"🔍 正在获取 Yande #{post_id} 原图信息...",
+        parse_mode=ParseMode.HTML
+    )
+    post = await yande_finder.get_post_by_id(post_id)
+    if not post:
+        await status_msg.edit_text(f"⚠️ 未在 Yande.re 找到 ID 为 {post_id} 的帖子。")
+        return
+
+    await status_msg.edit_text(
+        f"⏳ 正在下载最高清原图 (<code>{post.width} × {post.height}</code>, <code>{post.size_mb} MB</code>)...",
+        parse_mode=ParseMode.HTML
+    )
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+    yande_temp_dir = Path(settings.output_dir) / "yande"
+    try:
+        local_file = await yande_finder.download_image(post, yande_temp_dir)
+        file_size = local_file.stat().st_size
+        file_size_mb = round(file_size / (1024 * 1024), 2)
+
+        if file_size <= 49.5 * 1024 * 1024:
+            with open(local_file, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=local_file.name,
+                    caption=post.format_caption(),
+                    parse_mode=ParseMode.HTML
+                )
+            local_file.unlink(missing_ok=True)
+            await status_msg.delete()
+        else:
+            direct_url = tunnel_server.get_file_url(local_file)
+            huge_text = (
+                f"{post.format_caption()}\n\n"
+                f"🚀 <b>【超大文件直链（超过 TG 50MB 限制）】</b>\n"
+                f"👉 <a href=\"{direct_url}\">📥 点击极速下载完整无损原件 ({file_size_mb} MB)</a>"
+            )
+            await status_msg.edit_text(huge_text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Error handling Yande text request: {e}")
+        await status_msg.edit_text(f"❌ 下载原图失败：{e}")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming user message with Pinterest links."""
+    """Handle incoming user message with Pinterest links or Yande text IDs."""
     text = update.message.text or ""
     # Check if user sent a raw cookie string directly (e.g. from mobile browser)
     if ("_pinterest_sess" in text or "_auth" in text) and not PINTEREST_URL_REGEX.search(text):
@@ -490,10 +775,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     match = PINTEREST_URL_REGEX.search(text)
     if not match:
+        # Check if text contains Yande ID or URL
+        yande_id = yande_finder.extract_id_from_text(text)
+        if yande_id:
+            await handle_yande_text_request(update, context, yande_id)
+            return
+
         await update.message.reply_text(
-            "⚠️ 未检测到有效的 Pinterest 链接。\n请直接发送 Pinterest 图板或 Pin 链接，例如：\n"
-            "`https://pin.it/6IyIv54kK`\n或点击下方快捷菜单：",
-            parse_mode=ParseMode.MARKDOWN,
+            "⚠️ 未检测到有效链接或图片。\n\n"
+            "👉 <b>支持以下操作</b>：\n"
+            "1. <b>多选转发 Yande 每日热图</b>：在 TG 群中多选喜欢的图片直接一口气转发给我，自动获取最高清原图。\n"
+            "2. <b>发送 Pinterest 链接</b>：发送图板或单 Pin 链接进行批量挖掘与打包。\n"
+            "3. <b>发送 Yande 链接或 ID</b>：例如发送 <code>https://yande.re/post/show/1270146</code> 或 <code>1270146</code>。",
+            parse_mode=ParseMode.HTML,
             reply_markup=get_shortcut_keyboard()
         )
         return
@@ -716,6 +1010,7 @@ def run_bot(token: Optional[str] = None):
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("yande", yande_help_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("sample", sample_command))
     app.add_handler(CommandHandler("cookie", cookie_command))
@@ -727,11 +1022,18 @@ def run_bot(token: Optional[str] = None):
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("cancel", stop_command))
 
+    # Yande.re photo & image document handlers (forwarded or direct)
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_or_image))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo_or_image))
+
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
+    async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        logger.warning(f"Telegram Bot Update error: {context.error}")
 
+    app.add_error_handler(global_error_handler)
 
     logger.info("Telegram Bot is running! Press Ctrl+C to stop.")
     app.run_polling()
