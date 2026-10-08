@@ -32,7 +32,8 @@ from telegram.ext import (
 
 from config import settings
 from core.pipeline import BoardPipeline
-from core.yande_finder import yande_finder, YandePost
+from core.yande_finder import yande_finder, YandePost, package_yande_batch, YandePackageResult
+import zipfile
 from utils.logger import logger
 from utils.tunnel_server import tunnel_server
 
@@ -475,6 +476,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await help_command(update, context)
     elif data == "yande_help":
         await yande_help_command(update, context)
+    elif data == "unpack_yande_batch":
+        await handle_unpack_yande_batch(update, context)
     elif data == "status":
         await status_command(update, context)
     elif data == "sample":
@@ -544,7 +547,7 @@ class YandeBatchCoordinator:
 
         status_msg = None
         processed_count = 0
-        success_count = 0
+        downloaded_items: List[Tuple[YandePost, Path]] = []
         yande_temp_dir = Path(settings.output_dir) / "yande"
         yande_temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -557,7 +560,7 @@ class YandeBatchCoordinator:
             if initial_count == 1:
                 status_text = "🔍 正在解析图片并搜寻 Yande.re 最高清原图..."
             else:
-                status_text = f"📥 已接收 <b>{initial_count}</b> 张转发图片，正在批量搜寻 Yande.re 最高清原图..."
+                status_text = f"📥 已接收 <b>{initial_count}</b> 张转发图片，正在批量搜寻并准备打包 ZIP..."
 
             status_msg = await context.bot.send_message(
                 chat_id=chat_id,
@@ -620,7 +623,7 @@ class YandeBatchCoordinator:
                     )
                     continue
 
-                # 3. Download and send original
+                # 3. Download original illustration
                 try:
                     if total_current > 1 and status_msg:
                         try:
@@ -632,55 +635,134 @@ class YandeBatchCoordinator:
                             pass
 
                     local_file = await yande_finder.download_image(post, yande_temp_dir)
-                    file_size = local_file.stat().st_size
-                    file_size_mb = round(file_size / (1024 * 1024), 2)
-
-                    if file_size <= 49.5 * 1024 * 1024:
-                        with open(local_file, "rb") as f:
-                            await context.bot.send_document(
-                                chat_id=chat_id,
-                                document=f,
-                                filename=local_file.name,
-                                caption=post.format_caption(),
-                                parse_mode=ParseMode.HTML,
-                                reply_to_message_id=item.message_id
-                            )
-                        local_file.unlink(missing_ok=True)
-                    else:
-                        direct_url = tunnel_server.get_file_url(local_file)
-                        huge_text = (
-                            f"{post.format_caption()}\n\n"
-                            f"🚀 <b>【超大文件直链（超过 TG 50MB 限制）】</b>\n"
-                            f"👉 <a href=\"{direct_url}\">📥 点击极速下载完整无损原件 ({file_size_mb} MB)</a>"
-                        )
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=huge_text,
-                            parse_mode=ParseMode.HTML,
-                            reply_to_message_id=item.message_id
-                        )
-
-                    success_count += 1
+                    downloaded_items.append((post, local_file))
                 except Exception as dl_err:
-                    logger.error(f"Error downloading/sending Yande #{post.id}: {dl_err}")
+                    logger.error(f"Error downloading Yande #{post.id}: {dl_err}")
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=f"❌ 发送 Yande #{post.id} 原图失败：{dl_err}",
+                        text=f"❌ 下载 Yande #{post.id} 原图失败：{dl_err}",
                         reply_to_message_id=item.message_id
                     )
 
-            if status_msg:
-                try:
-                    finish_text = (
-                        f"🎉 <b>Yande 原图处理完毕！</b>\n"
-                        f"• 成功提取交付：<b>{success_count}</b> 张高清原图\n"
-                        f"• 格式：无损文件文档 (Document) 发送，保持 100% 原始母盘细节！"
+            # All items processed! Deliver either single document or packaged ZIP:
+            if len(downloaded_items) == 0:
+                if status_msg:
+                    await status_msg.edit_text("⚠️ 本次未成功提取到任何 Yande 原图。")
+                return
+
+            if len(downloaded_items) == 1:
+                # Single item: deliver directly as document for instant in-chat viewing
+                post, local_file = downloaded_items[0]
+                file_size = local_file.stat().st_size
+                file_size_mb = round(file_size / (1024 * 1024), 2)
+                if file_size <= 49.5 * 1024 * 1024:
+                    with open(local_file, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            filename=local_file.name,
+                            caption=post.format_caption(),
+                            parse_mode=ParseMode.HTML
+                        )
+                    local_file.unlink(missing_ok=True)
+                else:
+                    direct_url = tunnel_server.get_file_url(local_file)
+                    huge_text = (
+                        f"{post.format_caption()}\n\n"
+                        f"🚀 <b>【超大文件直链（超过 TG 50MB 限制）】</b>\n"
+                        f"👉 <a href=\"{direct_url}\">📥 点击极速下载完整无损原件 ({file_size_mb} MB)</a>"
                     )
-                    await status_msg.edit_text(finish_text, parse_mode=ParseMode.HTML)
-                    await asyncio.sleep(8)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=huge_text,
+                        parse_mode=ParseMode.HTML
+                    )
+                if status_msg:
                     await status_msg.delete()
-                except Exception:
-                    pass
+
+            else:
+                # Multiple items (>= 2): PACKAGE INTO SINGLE ZIP ARCHIVE!
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(
+                            f"📦 全部 <b>{len(downloaded_items)}</b> 张原图已下载完成，正在打包为 ZIP 压缩包...",
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+
+                pkg = package_yande_batch(downloaded_items, yande_temp_dir)
+                recent_yande_zip_packages[chat_id] = pkg
+                direct_url = tunnel_server.get_file_url(pkg.zip_path)
+
+                direct_section = ""
+                if direct_url:
+                    direct_section = (
+                        f"\n🚀 <b>【手机满速高速直链下载（推荐）】</b>\n"
+                        f"👉 <a href=\"{direct_url}\">📥 点击一键极速下载【完整合集 ZIP】({pkg.total_size_mb} MB)</a>\n"
+                        f"<i>(手机浏览器点开直接满速保存，无需在 TG 内等待分卷)</i>\n"
+                    )
+
+                preview_list = []
+                for idx, p in enumerate(pkg.posts[:8], start=1):
+                    auth = f" - {p.author}" if p.author else ""
+                    preview_list.append(f"{idx}. <b>#{p.id}</b> ({p.width}×{p.height}){auth}")
+                if len(pkg.posts) > 8:
+                    preview_list.append(f"... 等共计 {len(pkg.posts)} 张最高清插画")
+
+                manifest_preview = "\n".join(preview_list)
+                caption_text = (
+                    f"🎉 <b>【Yande 批量高清原图打包完成】</b>\n\n"
+                    f"📊 <b>合集统计</b>：\n"
+                    f"• 收录原图总数：<b>{pkg.total_count}</b> 张（已整理打包）\n"
+                    f"• 压缩包总大小：<b>{pkg.total_size_mb} MB</b>\n"
+                    f"{direct_section}\n"
+                    f"📋 <b>包含作品清单</b>：\n"
+                    f"{manifest_preview}"
+                )
+
+                unpack_keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 展开逐张发送单图", callback_data="unpack_yande_batch")]
+                ])
+
+                zip_size = pkg.zip_path.stat().st_size
+                if zip_size <= 49.5 * 1024 * 1024:
+                    with open(pkg.zip_path, "rb") as zf:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=zf,
+                            filename=pkg.zip_path.name,
+                            caption=caption_text,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=unpack_keyboard
+                        )
+                else:
+                    huge_msg = (
+                        f"{caption_text}\n\n"
+                        f"📦 <i>由于总压缩包大小超出 Telegram 50MB 上传限制，请点击上方极速直链一键下载完整 ZIP 包！</i>"
+                    )
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=huge_msg,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=unpack_keyboard
+                    )
+                    if len(pkg.all_parts) > 1 and len(pkg.all_parts) <= 4:
+                        for idx, part in enumerate(pkg.all_parts, start=1):
+                            with open(part, "rb") as pf:
+                                await context.bot.send_document(
+                                    chat_id=chat_id,
+                                    document=pf,
+                                    filename=part.name,
+                                    caption=f"📦 分卷 {idx}/{len(pkg.all_parts)} ({round(part.stat().st_size/(1024*1024), 2)} MB)"
+                                )
+
+                # Clean up raw uncompressed images to save space
+                for _, local_file in downloaded_items:
+                    local_file.unlink(missing_ok=True)
+
+                if status_msg:
+                    await status_msg.delete()
 
         except Exception as queue_err:
             logger.error(f"Queue processing error for chat {chat_id}: {queue_err}")
@@ -690,7 +772,41 @@ class YandeBatchCoordinator:
                 self._tasks.pop(chat_id, None)
 
 
+recent_yande_zip_packages: Dict[int, YandePackageResult] = {}
 yande_batch_coordinator = YandeBatchCoordinator()
+
+
+async def handle_unpack_yande_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle callback to unpack and send images individually from the packaged ZIP."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    pkg = recent_yande_zip_packages.get(chat_id)
+    if not pkg or not pkg.zip_path.is_file():
+        await query.answer("⚠️ 暂无可展开的历史 ZIP 压缩包或文件已过期。", show_alert=True)
+        return
+
+    await query.answer(f"📦 正在解压并逐张发送 {pkg.total_count} 张原图...")
+    post_map = {p.id: p for p in pkg.posts}
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+    try:
+        with zipfile.ZipFile(pkg.zip_path, "r") as zf:
+            members = [m for m in sorted(zf.namelist()) if not m.endswith(".txt")]
+            for m in members:
+                m_id = re.search(r"yande_(\d+)_", m)
+                post = post_map.get(int(m_id.group(1))) if m_id else None
+                caption = post.format_caption() if post else f"🎨 <b>Yande 原图</b>: <code>{m}</code>"
+                data = zf.read(m)
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=data,
+                    filename=m,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML
+                )
+    except Exception as e:
+        logger.error(f"Error unpacking ZIP: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ 展开单图失败：{e}")
 
 
 async def handle_photo_or_image(update: Update, context: ContextTypes.DEFAULT_TYPE):

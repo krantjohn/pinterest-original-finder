@@ -8,12 +8,14 @@ Features:
 - Clean formatting for Telegram document delivery
 """
 import asyncio
+from datetime import datetime
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 import urllib.parse
+import zipfile
 
 import httpx
 from bs4 import BeautifulSoup
@@ -312,6 +314,96 @@ class YandeFinder:
 
         logger.info(f"Successfully downloaded Yande #{post.id} ({dest_path.stat().st_size / (1024*1024):.2f} MB)")
         return dest_path
+
+
+@dataclass
+class YandePackageResult:
+    """Result of packaging a batch of Yande illustrations into ZIP."""
+    zip_path: Path
+    total_count: int
+    total_size_bytes: int
+    all_parts: List[Path]
+    posts: List[YandePost]
+
+    @property
+    def total_size_mb(self) -> float:
+        return round(self.total_size_bytes / (1024 * 1024), 2)
+
+
+def package_yande_batch(
+    items: List[Tuple[YandePost, Path]],
+    output_dir: Path
+) -> YandePackageResult:
+    """
+    Package multiple downloaded Yande illustrations into a standalone ZIP archive with UTF-8 manifest.
+    Inside the ZIP:
+    - 01_yande_{id}_{width}x{height}.{ext}
+    - 02_yande_{id}_{width}x{height}.{ext}
+    - 00_README_清单说明.txt
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    count = len(items)
+    zip_filename = f"Yande_Batch_{timestamp}_{count}P.zip"
+    zip_path = output_dir / zip_filename
+
+    manifest_lines = [
+        "=" * 60,
+        "Yande.re 高清原图批量合集清单",
+        f"打包时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"收录图片数: {count} 张",
+        "=" * 60,
+        ""
+    ]
+
+    total_bytes = 0
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for idx, (post, file_path) in enumerate(items, start=1):
+            if file_path.is_file():
+                arcname = f"{idx:02d}_yande_{post.id}_{post.width}x{post.height}.{post.file_ext}"
+                zf.write(file_path, arcname=arcname)
+                total_bytes += file_path.stat().st_size
+
+                manifest_lines.append(f"[{idx:02d}] Yande #{post.id}")
+                manifest_lines.append(f"     文件名: {arcname}")
+                manifest_lines.append(f"     分辨率: {post.width} × {post.height}")
+                manifest_lines.append(f"     大小: {post.size_mb} MB")
+                manifest_lines.append(f"     分级: {post.rating_desc}")
+                manifest_lines.append(f"     画师: {post.author or '未知'}")
+                if post.source:
+                    manifest_lines.append(f"     原作来源: {post.source}")
+                manifest_lines.append(f"     原帖链接: {post.post_url}")
+                manifest_lines.append("")
+
+        manifest_text = "\n".join(manifest_lines)
+        zf.writestr("00_README_清单说明.txt", manifest_text.encode("utf-8"))
+
+    zip_size = zip_path.stat().st_size
+
+    # Split into multi-parts if > 48.5MB (Telegram document upload limit is 50MB)
+    all_parts = [zip_path]
+    max_part_bytes = int(48.5 * 1024 * 1024)
+    if zip_size > max_part_bytes:
+        all_parts = []
+        part_num = 1
+        with open(zip_path, "rb") as src:
+            while True:
+                chunk = src.read(max_part_bytes)
+                if not chunk:
+                    break
+                part_path = output_dir / f"Yande_Batch_{timestamp}_{count}P.part{part_num}.zip"
+                with open(part_path, "wb") as dst:
+                    dst.write(chunk)
+                all_parts.append(part_path)
+                part_num += 1
+
+    return YandePackageResult(
+        zip_path=zip_path,
+        total_count=count,
+        total_size_bytes=zip_size,
+        all_parts=all_parts,
+        posts=[p for p, _ in items]
+    )
 
 
 # Global singleton instance
